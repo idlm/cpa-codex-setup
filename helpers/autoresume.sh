@@ -24,6 +24,7 @@ MAX_ROUNDS=24              # -m 覆盖; 每轮通常对应一个 5 小时窗口
 POLL=60                    # watch 模式抓屏间隔(秒)
 BUFFER=45                  # 重置时刻之后再多等几秒, 防止边界抖动
 FALLBACK_WAIT=300          # 拿不到配额信号时的保守重试间隔
+SIGNAL_LAG=90              # -l 覆盖; 上游已 429 但 CPA 配额信号还没更新时的冷静期
 WORKDIR=""                 # -C 覆盖
 
 command -v python3 >/dev/null || { echo "需要 python3" >&2; exit 1; }
@@ -112,6 +113,16 @@ is_limited() {   # $1=日志文件 $2=退出码
   grep -qiE '429 Too Many Requests|exceeded retry limit|usage_limit_reached|usage limit|rate.?limit' "$1"
 }
 
+# 上游已经返回 429, 但 CPA 的配额信号是从响应头里学的, 可能还没刷到 100%。
+# 这时 next_reset 会返回 0(看起来可用), 若直接重试就会快速空转烧掉轮数。
+# 所以先强制冷静一段时间, 给信号一点时间落地。
+cool_down_if_signal_lags() {
+  if [ "$(next_reset)" = "0" ]; then
+    say "上游已限流但 CPA 配额信号尚未更新, 先冷静 ${SIGNAL_LAG}s 再查"
+    sleep "$SIGNAL_LAG"
+  fi
+}
+
 # ---- run 模式 ----------------------------------------------------------------
 mode_run() {
   local prompt="$1" round=0 out rc first=1
@@ -140,6 +151,7 @@ mode_run() {
     if is_limited "$out" "$rc"; then
       first=0
       say "第 $round 轮撞到限流 (exit $rc), 转入等待"
+      cool_down_if_signal_lags
       continue
     fi
     say "第 $round 轮以 exit $rc 失败, 且不是限流 —— 停止, 详见 $LOG"
@@ -174,6 +186,7 @@ mode_watch() {
     if printf '%s' "$screen_txt" | grep -qiE "hit your usage limit|usage limit|Try again later|429 Too Many Requests|exceeded retry limit"; then
       round=$((round + 1))
       say "第 $round 次检测到限流提示, 转入等待"
+      cool_down_if_signal_lags
       wait_for_quota || return 1
       say "配额已恢复, 向会话发送继续指令"
       screen -S "$SESSION" -X stuff "继续未完成的工作$(printf '\r')" >/dev/null 2>&1 \
@@ -198,6 +211,7 @@ usage() {
   -m N         最大轮数 (默认 24; 每轮通常对应一个 5 小时窗口)
   -C DIR       run 模式的工作目录
   -p SEC       watch 模式抓屏间隔 (默认 60)
+  -l SEC       撞到 429 但 CPA 配额信号还没更新时的冷静期 (默认 90)
 
 典型用法 —— 把 run 模式本身放进 screen, 断线也不影响:
   screen -dmS cpa-run -L -Logfile @AUTH_DIR@/run.log \
@@ -215,12 +229,13 @@ EOF
 }
 
 MODE="${1:-}"; shift 2>/dev/null || true
-while getopts "s:m:C:p:h" o; do
+while getopts "s:m:C:p:l:h" o; do
   case "$o" in
     s) SESSION="$OPTARG" ;;
     m) MAX_ROUNDS="$OPTARG" ;;
     C) WORKDIR="$OPTARG" ;;
     p) POLL="$OPTARG" ;;
+    l) SIGNAL_LAG="$OPTARG" ;;
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
