@@ -49,6 +49,7 @@ CODEX_VERSION="${CODEX_VERSION:-0.153.2}"     # 已验证可用的版本, 可设
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 SKIP_CODEX="${SKIP_CODEX:-0}"
 SKIP_BWRAP="${SKIP_BWRAP:-0}"
+SKIP_NODE="${SKIP_NODE:-0}"
 
 # ---- 输出 --------------------------------------------------------------------
 info() { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
@@ -62,21 +63,176 @@ CPA_TMP=""
 cleanup() { [ -n "${CPA_TMP:-}" ] && rm -rf "$CPA_TMP"; return 0; }
 trap cleanup EXIT
 
-# ---- 1. 前置检查 -------------------------------------------------------------
+# ---- 0. 命令行参数 -----------------------------------------------------------
+usage() {
+  cat <<'EOF'
+CLIProxyAPI (CPA) + Codex CLI 一键部署
+
+用法:
+  sudo ./install.sh [选项]
+  curl -fsSL <raw>/install.sh | sudo bash -s -- [选项]      # 注意 -s --
+
+选项                          说明                              等价环境变量
+  --port N                    监听端口 (默认 8317)              CPA_PORT
+  --host ADDR                 监听地址 (默认 127.0.0.1)         CPA_HOST
+  --listen-all                绑定所有网卡, 等价 --host ""       CPA_HOST=""
+  --dir PATH                  安装目录 (默认 /opt/cliproxyapi)   CPA_DIR
+  --home PATH                 服务用户家目录 (默认 /root)        TARGET_HOME
+  --auth-dir PATH             配置与凭据目录                     AUTH_DIR
+  --service NAME              systemd 单元名 (默认 cliproxyapi)  SERVICE_NAME
+  --cpa-version VER           CPA 版本 (默认 latest)             CPA_VERSION
+  --codex-version VER         Codex CLI 版本 (默认 0.153.2)      CODEX_VERSION
+  --model NAME                默认模型 (默认 gpt-5.6-sol)        CODEX_MODEL
+  --skip-codex                不安装 Codex CLI                   SKIP_CODEX=1
+  --skip-bwrap                不安装 bubblewrap                  SKIP_BWRAP=1
+  --skip-node                 缺 Node.js 时也不自动安装          SKIP_NODE=1
+  -h, --help                  显示本帮助
+
+示例:
+  curl -fsSL <raw>/install.sh | sudo bash -s -- --port 9000
+  curl -fsSL <raw>/install.sh | sudo bash -s -- --skip-codex --model gpt-5.5
+  sudo ./install.sh --listen-all --port 8317
+
+缺失依赖会自动安装 (curl/tar/openssl/python3/screen, 以及 Codex 需要的
+Node.js >= 18)。支持 apt / dnf / yum / pacman / zypper。
+EOF
+}
+
+need_val() { [ $# -ge 2 ] && [ -n "${2#--}" ] || die "选项 $1 缺少取值 (--help 看用法)"; }
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)          need_val "$@"; CPA_PORT="$2"; shift 2 ;;
+      --host)          [ $# -ge 2 ] || die "选项 --host 缺少取值"; CPA_HOST="$2"; shift 2 ;;
+      --listen-all)    CPA_HOST=""; shift ;;
+      --dir)           need_val "$@"; CPA_DIR="$2"; shift 2 ;;
+      --home)          need_val "$@"; TARGET_HOME="$2"; AUTH_DIR="$2/.cli-proxy-api"
+                       CODEX_HOME="$2/.codex"; shift 2 ;;
+      --auth-dir)      need_val "$@"; AUTH_DIR="$2"; shift 2 ;;
+      --service)       need_val "$@"; SERVICE_NAME="$2"; shift 2 ;;
+      --cpa-version)   need_val "$@"; CPA_VERSION="$2"; shift 2 ;;
+      --codex-version) need_val "$@"; CODEX_VERSION="$2"; shift 2 ;;
+      --model)         need_val "$@"; CODEX_MODEL="$2"; shift 2 ;;
+      --skip-codex)    SKIP_CODEX=1; shift ;;
+      --skip-bwrap)    SKIP_BWRAP=1; shift ;;
+      --skip-node)     SKIP_NODE=1; shift ;;
+      -h|--help)       usage; exit 0 ;;
+      *) die "未知参数: $1 (--help 看用法)" ;;
+    esac
+  done
+}
+
+# ---- 1. 环境检测与依赖自动安装 -----------------------------------------------
+PKG=""
+detect_pkg_mgr() {
+  if   command -v apt-get >/dev/null; then PKG=apt
+  elif command -v dnf     >/dev/null; then PKG=dnf
+  elif command -v yum     >/dev/null; then PKG=yum
+  elif command -v pacman  >/dev/null; then PKG=pacman
+  elif command -v zypper  >/dev/null; then PKG=zypper
+  else PKG=none; fi
+}
+
+# 包名在各发行版不完全一致, 这里做最小映射
+pkg_name() {
+  case "$1:$PKG" in
+    python3:pacman) echo python ;;
+    coreutils:*)    echo coreutils ;;
+    *)              echo "${1}" ;;
+  esac
+}
+
+pkg_install() {
+  local pkgs=() p
+  for p in "$@"; do pkgs+=("$(pkg_name "$p")"); done
+  case "$PKG" in
+    apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1 ;;
+    dnf)    dnf install -y -q "${pkgs[@]}" >/dev/null 2>&1 ;;
+    yum)    yum install -y -q "${pkgs[@]}" >/dev/null 2>&1 ;;
+    pacman) pacman -Sy --noconfirm --needed "${pkgs[@]}" >/dev/null 2>&1 ;;
+    zypper) zypper -q install -y "${pkgs[@]}" >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
+}
+
+# 确保一批命令可用; 缺失则尝试安装。$1=hard 时装不上就中止, soft 只警告。
+ensure_cmds() {
+  local level="$1"; shift
+  local missing=() c
+  for c in "$@"; do command -v "$c" >/dev/null || missing+=("$c"); done
+  [ ${#missing[@]} -eq 0 ] && return 0
+
+  if [ "$PKG" = "none" ]; then
+    [ "$level" = "hard" ] && die "缺少 ${missing[*]}, 且未识别到包管理器, 请手动安装"
+    warn "缺少 ${missing[*]}, 未识别到包管理器 —— 相关功能不可用"
+    return 1
+  fi
+
+  info "自动安装缺失依赖 (${PKG}): ${missing[*]}"
+  # sha256sum 来自 coreutils, 名字对不上, 单独换一下
+  local pkgs=() m
+  for m in "${missing[@]}"; do
+    case "$m" in sha256sum) pkgs+=(coreutils) ;; *) pkgs+=("$m") ;; esac
+  done
+  if pkg_install "${pkgs[@]}"; then
+    local still=()
+    for c in "${missing[@]}"; do command -v "$c" >/dev/null || still+=("$c"); done
+    if [ ${#still[@]} -eq 0 ]; then ok "依赖就绪: ${missing[*]}"; return 0; fi
+    [ "$level" = "hard" ] && die "安装后仍缺少 ${still[*]}, 请手动处理"
+    warn "安装后仍缺少 ${still[*]} —— 相关功能不可用"
+    return 1
+  fi
+  [ "$level" = "hard" ] && die "安装 ${missing[*]} 失败, 请手动安装后重跑"
+  warn "安装 ${missing[*]} 失败 —— 相关功能不可用"
+  return 1
+}
+
+# Codex CLI 需要 Node.js >= 18。没有就装 —— apt 系走 NodeSource(版本新),
+# 其他发行版用自带仓库(可能偏旧, 装完仍不达标则放弃 Codex 而不是中止部署)。
+NODE_MAJOR_MIN=18
+node_ok() {
+  command -v npm >/dev/null || return 1
+  command -v node >/dev/null || return 1
+  local v; v="$(node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
+  [ -n "$v" ] && [ "$v" -ge "$NODE_MAJOR_MIN" ] 2>/dev/null
+}
+
+ensure_node() {
+  node_ok && { info "Node.js $(node -v) 已满足要求"; return 0; }
+  if [ "${SKIP_NODE:-0}" = "1" ]; then
+    warn "指定了 --skip-node, 跳过 Node.js 安装"; return 1
+  fi
+
+  local cur; cur="$(node -v 2>/dev/null || echo 未安装)"
+  info "Codex CLI 需要 Node.js >= $NODE_MAJOR_MIN (当前: $cur), 开始安装"
+  if [ "$PKG" = "apt" ]; then
+    # NodeSource 官方脚本, 会往 /etc/apt/sources.list.d 加源
+    if curl -fsSL https://deb.nodesource.com/setup_22.x -o "$CPA_TMP/nodesource.sh" 2>/dev/null \
+       && bash "$CPA_TMP/nodesource.sh" >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs >/dev/null 2>&1 || true
+    fi
+  else
+    pkg_install nodejs npm || true
+  fi
+
+  if node_ok; then ok "Node.js $(node -v) 安装完成"; return 0; fi
+  warn "Node.js 安装失败或版本仍低于 $NODE_MAJOR_MIN —— 跳过 Codex CLI"
+  warn "CPA 本身不受影响; 装好 Node.js 后重跑本脚本即可补上 Codex"
+  return 1
+}
+
 preflight() {
   [ "$(id -u)" -eq 0 ] || die "需要 root 权限, 请用 sudo 执行"
   command -v systemctl >/dev/null || die "未检测到 systemd, 本脚本不适用"
+  detect_pkg_mgr
+  [ "$PKG" = "none" ] && warn "未识别到包管理器, 缺失依赖需要你手动安装"
 
-  local missing=()
-  for c in curl tar sha256sum openssl; do
-    command -v "$c" >/dev/null || missing+=("$c")
-  done
-  if [ ${#missing[@]} -gt 0 ]; then
-    info "安装缺失依赖: ${missing[*]}"
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tar coreutils openssl \
-      || die "依赖安装失败, 请手动安装: ${missing[*]}"
-  fi
+  # 硬依赖: 缺了没法继续
+  ensure_cmds hard curl tar sha256sum openssl
+  # 软依赖: status.sh / autoresume.sh 需要 python3; watch 模式需要 screen
+  ensure_cmds soft python3 screen || true
 
   case "$(uname -m)" in
     x86_64|amd64) ARCH="amd64" ;;
@@ -85,10 +241,10 @@ preflight() {
   esac
 
   if [ "$CPA_HOST" != "127.0.0.1" ] && [ "$CPA_HOST" != "localhost" ]; then
-    warn "CPA_HOST=$CPA_HOST 会把服务暴露到该地址可达的网络。"
+    warn "监听地址为 '${CPA_HOST:-所有网卡}' —— 服务会暴露到该地址可达的网络。"
     warn "api-keys 鉴权虽已启用, 仍请确保防火墙只放行可信来源。"
   fi
-  ok "环境检查通过 (arch=$ARCH)"
+  ok "环境检查通过 (arch=$ARCH, pkg=$PKG)"
 }
 
 # ---- 2. 解析版本号 -----------------------------------------------------------
@@ -305,10 +461,7 @@ health_check() {
 
 # ---- 8. Codex CLI ------------------------------------------------------------
 install_codex() {
-  if ! command -v npm >/dev/null; then
-    warn "未检测到 npm, 跳过 Codex CLI 安装。装好 Node.js (>=18) 后重跑本脚本即可。"
-    return 0
-  fi
+  ensure_node || return 0
 
   local want="$CODEX_VERSION" cur=""
   cur="$(codex --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
@@ -425,6 +578,7 @@ EOF
 
 # ---- main --------------------------------------------------------------------
 main() {
+  parse_args "$@"
   preflight
   resolve_version
   install_binary

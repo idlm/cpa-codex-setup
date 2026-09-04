@@ -17,46 +17,55 @@ CPA 是一个协议转换代理：它把你手里的 **CLI 订阅**（ChatGPT Pl
 
 | 项 | 要求 |
 |---|---|
-| 系统 | Debian / Ubuntu 等 systemd 发行版 |
+| 系统 | 任意 systemd 发行版（Debian / Ubuntu / RHEL 系 / Arch / openSUSE 都行） |
 | 架构 | x86_64 或 aarch64 |
 | 权限 | root（`sudo`） |
-| 依赖 | `curl` `tar` `sha256sum` `openssl`（缺失会自动装） |
-| Codex CLI | 需要 Node.js ≥ 18 的 `npm`；没有则自动跳过这步 |
+| 其他 | 没有了 —— 缺什么脚本自己装 |
 
-## 快速开始
+脚本会检测包管理器（`apt` / `dnf` / `yum` / `pacman` / `zypper`）并自动补齐：
 
-**方式一：curl 一键**
+- **硬依赖** `curl` `tar` `sha256sum` `openssl` —— 装不上就中止，因为没法继续
+- **软依赖** `python3`（`status.sh` / `autoresume.sh` 用）、`screen`（`watch` 模式用）—— 装不上只警告，主流程照跑
+- **Node.js ≥ 18** —— Codex CLI 需要。apt 系走 NodeSource 装 22.x，其他发行版用自带仓库；装完仍不达标就跳过 Codex 而不是让整个部署失败（CPA 本身不需要 Node）
+
+想自己管 Node 就加 `--skip-node`。
+
+## 一键开始使用
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/idlm/cpa-codex-setup/main/install.sh | sudo bash
 ```
 
-带参数时把环境变量放在 `bash` 前面：
+带参数时加 `-s --`，后面直接跟选项：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/idlm/cpa-codex-setup/main/install.sh \
-  | sudo CPA_PORT=9000 SKIP_CODEX=1 bash
+  | sudo bash -s -- --port 9000 --model gpt-5.5
+
+# 只装 CPA，不碰 Codex
+curl -fsSL .../install.sh | sudo bash -s -- --skip-codex
 ```
 
-这种模式下脚本检测不到本地 `helpers/`，会自动从同一仓库的 raw 地址补齐三个辅助脚本模板，不需要 clone。
+管道模式下脚本读不到本地 `helpers/`，会自动从同一仓库的 raw 地址补齐三个辅助脚本模板，不需要 clone。
 
-管道执行意味着你在没读过内容的情况下把 root 交给一个远端脚本。想先审再跑：
+看全部选项：`sudo ./install.sh --help`，或见下面的[配置项](#配置项)。
+
+**想先审再跑**（管道执行等于把 root 交给一个远端脚本）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/idlm/cpa-codex-setup/main/install.sh -o install.sh
-less install.sh          # 看一遍
-sudo bash install.sh
+less install.sh
+sudo bash install.sh --port 9000
 ```
 
-**方式二：git clone（推荐，helpers/ 在本地可改）**
+**或者 clone 下来**（`helpers/` 在本地，改脚本更方便）：
 
 ```bash
-git clone https://github.com/idlm/cpa-codex-setup.git
-cd cpa-codex-setup
+git clone https://github.com/idlm/cpa-codex-setup.git && cd cpa-codex-setup
 sudo ./install.sh
 ```
 
-脚本依次完成：下载校验二进制 → 生成随机密钥 → 写最小化配置 → 注册 systemd → 健康检查 → 安装 Codex CLI 与 `config.toml` → 安装 bubblewrap。
+装完做什么：下载校验二进制 → 生成随机密钥 → 写配置 → 注册 systemd → 鉴权健康检查 → 装 Codex CLI 与 `config.toml` → 装 bubblewrap。全程幂等，重跑不会覆盖已有密钥和凭据。
 
 常用变体：
 
@@ -459,21 +468,32 @@ screen -S cpa-codex                                  # 里面手动跑 codex
 
 ## 配置项
 
-全部通过环境变量传给 `install.sh`：
+命令行参数和环境变量都行，参数优先。管道模式记得加 `-s --`。
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `CPA_VERSION` | `latest` | CPA 版本，如 `v7.2.149` |
-| `CPA_DIR` | `/opt/cliproxyapi` | 二进制与辅助脚本目录 |
-| `CPA_HOST` | `127.0.0.1` | 监听地址；改成 `0.0.0.0` 会暴露到网络 |
-| `CPA_PORT` | `8317` | 监听端口 |
-| `TARGET_HOME` | `/root` | 服务运行用户的家目录 |
-| `AUTH_DIR` | `$TARGET_HOME/.cli-proxy-api` | 配置与凭据目录 |
-| `SERVICE_NAME` | `cliproxyapi` | systemd 单元名 |
-| `CODEX_VERSION` | `0.153.2` | Codex CLI 版本，可设 `latest` |
-| `CODEX_MODEL` | `gpt-5.6-sol` | 写进 config.toml 的默认模型 |
-| `SKIP_CODEX` | `0` | 设 `1` 跳过 Codex CLI 安装与配置 |
-| `SKIP_BWRAP` | `0` | 设 `1` 跳过 bubblewrap 安装 |
+| 参数 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| `--port N` | `CPA_PORT` | `8317` | 监听端口 |
+| `--host ADDR` | `CPA_HOST` | `127.0.0.1` | 监听地址 |
+| `--listen-all` | `CPA_HOST=""` | — | 绑所有网卡，**会暴露到网络** |
+| `--dir PATH` | `CPA_DIR` | `/opt/cliproxyapi` | 二进制与辅助脚本目录 |
+| `--home PATH` | `TARGET_HOME` | `/root` | 服务用户家目录（同时决定 auth-dir 与 codex home） |
+| `--auth-dir PATH` | `AUTH_DIR` | `$TARGET_HOME/.cli-proxy-api` | 配置与凭据目录 |
+| `--service NAME` | `SERVICE_NAME` | `cliproxyapi` | systemd 单元名 |
+| `--cpa-version VER` | `CPA_VERSION` | `latest` | CPA 版本，如 `v7.2.149` |
+| `--codex-version VER` | `CODEX_VERSION` | `0.153.2` | Codex CLI 版本，可设 `latest` |
+| `--model NAME` | `CODEX_MODEL` | `gpt-5.6-sol` | 写进 `config.toml` 的默认模型 |
+| `--skip-codex` | `SKIP_CODEX=1` | — | 不装 Codex CLI |
+| `--skip-bwrap` | `SKIP_BWRAP=1` | — | 不装 bubblewrap |
+| `--skip-node` | `SKIP_NODE=1` | — | 缺 Node.js 时也不自动装 |
+| `-h, --help` | — | — | 显示帮助 |
+
+改了端口或目录后重跑：`config.yaml` 已存在时会被跳过（不覆盖你的手工调整），要让新值生效得先删掉它。
+
+同一台机器装多份实例就靠 `--dir` + `--home` + `--service` + `--port` 四件套错开，互不干扰：
+
+```bash
+sudo ./install.sh --dir /opt/cpa-b --home /srv/cpa-b --service cliproxyapi-b --port 8318
+```
 
 ## 文件布局
 
@@ -592,6 +612,12 @@ key 不对。用 `sudo cat /root/.cli-proxy-api/.apikey.txt` 取当前 key；注
 ```bash
 sudo ./uninstall.sh            # 移除服务与安装目录，保留凭据（重装免重新授权）
 sudo ./uninstall.sh --purge    # 连凭据目录一起删，不可恢复
+```
+
+装的时候用了 `--dir` / `--home` / `--service`，卸载时传一样的值：
+
+```bash
+sudo ./uninstall.sh --purge -y --dir /opt/cpa-b --home /srv/cpa-b --service cliproxyapi-b
 ```
 
 不会碰 `~/.codex/config.toml`，也不会卸载 Codex CLI 或 bubblewrap —— 需要的话自己动手，安装前的备份在 `~/.codex/config.toml.bak.*`。

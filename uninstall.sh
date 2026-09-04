@@ -14,17 +14,43 @@ set -euo pipefail
 
 CPA_DIR="${CPA_DIR:-/opt/cliproxyapi}"
 TARGET_HOME="${TARGET_HOME:-/root}"
+AUTH_DIR_SET=0
+[ -n "${AUTH_DIR:-}" ] && AUTH_DIR_SET=1
 AUTH_DIR="${AUTH_DIR:-$TARGET_HOME/.cli-proxy-api}"
 SERVICE_NAME="${SERVICE_NAME:-cliproxyapi}"
 PURGE=0; ASSUME_YES=0
 
-for a in "$@"; do
-  case "$a" in
-    --purge) PURGE=1 ;;
-    -y|--yes) ASSUME_YES=1 ;;
-    *) echo "未知参数: $a" >&2; exit 1 ;;
+usage() {
+  cat <<'EOF'
+CLIProxyAPI (CPA) 卸载
+
+用法: sudo ./uninstall.sh [选项]
+
+  --purge          同时删除凭据目录 (不可恢复)
+  -y, --yes        跳过确认
+  --dir PATH       安装目录 (默认 /opt/cliproxyapi)
+  --home PATH      服务用户家目录 (默认 /root)
+  --auth-dir PATH  配置与凭据目录
+  --service NAME   systemd 单元名 (默认 cliproxyapi)
+  -h, --help       显示本帮助
+
+装的时候用了 --dir/--home/--service, 卸载时要传一样的值。
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --purge)    PURGE=1; shift ;;
+    -y|--yes)   ASSUME_YES=1; shift ;;
+    --dir)      CPA_DIR="$2"; shift 2 ;;
+    --home)     TARGET_HOME="$2"; shift 2 ;;
+    --auth-dir) AUTH_DIR="$2"; AUTH_DIR_SET=1; shift 2 ;;
+    --service)  SERVICE_NAME="$2"; shift 2 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "未知参数: $1" >&2; echo; usage; exit 1 ;;
   esac
 done
+[ "$AUTH_DIR_SET" = "1" ] || AUTH_DIR="$TARGET_HOME/.cli-proxy-api"
 
 [ "$(id -u)" -eq 0 ] || { echo "需要 root 权限" >&2; exit 1; }
 
