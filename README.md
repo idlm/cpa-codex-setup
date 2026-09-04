@@ -25,6 +25,31 @@ CPA 是一个协议转换代理：它把你手里的 **CLI 订阅**（ChatGPT Pl
 
 ## 快速开始
 
+**方式一：curl 一键**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/idlm/cpa-codex-setup/main/install.sh | sudo bash
+```
+
+带参数时把环境变量放在 `bash` 前面：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/idlm/cpa-codex-setup/main/install.sh \
+  | sudo CPA_PORT=9000 SKIP_CODEX=1 bash
+```
+
+这种模式下脚本检测不到本地 `helpers/`，会自动从同一仓库的 raw 地址补齐三个辅助脚本模板，不需要 clone。
+
+管道执行意味着你在没读过内容的情况下把 root 交给一个远端脚本。想先审再跑：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/idlm/cpa-codex-setup/main/install.sh -o install.sh
+less install.sh          # 看一遍
+sudo bash install.sh
+```
+
+**方式二：git clone（推荐，helpers/ 在本地可改）**
+
 ```bash
 git clone https://github.com/idlm/cpa-codex-setup.git
 cd cpa-codex-setup
@@ -382,6 +407,20 @@ screen -S cpa-codex                                  # 里面手动跑 codex
 ```
 
 `run` 模式首轮新建会话，之后每轮用 `codex exec resume --last` 续接同一会话，上下文不丢。`watch` 模式靠 `screen -X hardcopy` 抓屏检测，恢复后用 `screen -X stuff` 把继续指令打进去。
+
+**解封那一刻具体发生什么**
+
+会自己接着跑，不需要你在场。以 `run` 模式为例，一次完整的限流—恢复循环是这样：
+
+1. `codex exec` 撞到 429，以 exit 1 退出，脚本识别为限流
+2. 查管理 API 拿到 `X-Codex-Primary-Reset-At`，算出还有多久，写进日志：`全部凭据限流中 → 等待 3h09m 至 09-04 08:29:16`
+3. 分 120 秒一段睡过去，每段醒来重查一次池子
+4. 到点（或中途你登了新号）→ 立即执行 `codex exec resume --last "继续未完成的工作"`，**接着上一个会话往下做**，不是从头重来
+5. 如果新窗口又用满了，回到第 1 步；如果任务做完（exit 0），打印「任务完成」并退出循环
+
+`watch` 模式同理，只是第 4 步换成往 screen 里 `stuff` 一条继续指令，由你原本那个交互式 codex 接着做。
+
+整个过程无人值守。把脚本本身放进 screen（见上面第一条命令），SSH 断开也不影响 —— 醒来时看 `tail -f /root/.cli-proxy-api/autoresume.log` 就知道中间发生了什么。
 
 选项：`-m N` 最大轮数（默认 24，每轮通常对应一个 5 小时窗口）、`-C DIR` 工作目录、`-s SESSION` 会话名、`-p SEC` 抓屏间隔、`-l SEC` 信号延迟冷静期（默认 90，见下）。
 

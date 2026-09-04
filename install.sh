@@ -13,10 +13,14 @@
 #    7. 健康检查: 验证鉴权拒绝未授权请求, 放行携带 key 的请求
 #
 #  用法:
-#    sudo ./install.sh                          # 全默认
+#    sudo ./install.sh                          # 全默认 (git clone 后)
 #    sudo CPA_PORT=9000 ./install.sh            # 换端口
 #    sudo SKIP_CODEX=1 ./install.sh             # 只装 CPA, 不动 Codex
 #    sudo CPA_VERSION=v7.2.149 ./install.sh     # 锁定版本
+#
+#    # curl 一键 (无需 clone; helpers/ 模板会自动从 REPO_RAW 下载)
+#    curl -fsSL https://raw.githubusercontent.com/idlm/cpa-codex-setup/main/install.sh | sudo bash
+#    curl -fsSL .../install.sh | sudo CPA_PORT=9000 bash
 #
 #  幂等: 重复执行不会重新生成已有密钥, 不会删除已登录凭据;
 #        改动 config.yaml / config.toml 前一律先备份。
@@ -26,8 +30,11 @@
 set -euo pipefail
 
 readonly REPO="router-for-me/CLIProxyAPI"
-# 本脚本所在目录 —— helpers/ 模板从这里读取
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 本脚本所在目录。helpers/ 模板优先从这里读; curl | bash 模式下取不到,
+# 会自动回落到从 REPO_RAW 下载。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+# 本仓库的 raw 地址, fork 后改这里(或用环境变量覆盖)即可
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/idlm/cpa-codex-setup/main}"
 
 # ---- 可通过环境变量覆盖的配置 ------------------------------------------------
 CPA_VERSION="${CPA_VERSION:-latest}"          # latest 或 vX.Y.Z
@@ -209,8 +216,19 @@ EOF
 # ---- 5. 辅助脚本 (login / status / autoresume) -------------------------------
 # 模板放在仓库的 helpers/ 下, 这里只做占位符替换 + 落盘, 便于单独阅读和修改。
 install_helpers() {
-  local src="$SCRIPT_DIR/helpers"
-  [ -d "$src" ] || die "未找到 $src —— 请在 clone 出来的仓库目录里运行本脚本"
+  local src="${SCRIPT_DIR:-}/helpers"
+  if [ -z "${SCRIPT_DIR:-}" ] || [ ! -d "$src" ]; then
+    # curl | bash 模式: 本地没有仓库副本, 从 raw 地址取模板
+    info "未发现本地 helpers/, 从 $REPO_RAW 下载"
+    [ -n "${CPA_TMP:-}" ] || CPA_TMP="$(mktemp -d)"
+    src="$CPA_TMP/helpers"
+    install -d -m 0755 "$src"
+    local n
+    for n in login status autoresume; do
+      curl -fsSL --retry 3 "$REPO_RAW/helpers/$n.sh" -o "$src/$n.sh" \
+        || die "下载 helpers/$n.sh 失败 (检查网络, 或改用 git clone 方式安装)"
+    done
+  fi
 
   local probe="$CPA_HOST"
   [ -z "$probe" ] && probe="127.0.0.1"
