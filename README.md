@@ -365,6 +365,42 @@ logging-to-file: true  # 日志落盘而非只进 journald
 
 调完记得关掉 `debug`，它会把请求内容写进日志。
 
+### 限流自动续跑：`autoresume.sh`
+
+自动切换的前提是池里还有别的号。**只有一个账号、或者所有账号的窗口都用满时，CPA 无处可切**，长任务就卡在那里 —— 交互式 TUI 显示 `■ You've hit your usage limit. Try again later.`，`codex exec` 则以 exit 1 退出并打印 `ERROR: exceeded retry limit, last status: 429 Too Many Requests`。
+
+`autoresume.sh` 就是补这一段：算出最早的窗口重置时刻，睡到那个点，然后自动续跑，循环到任务做完。
+
+```bash
+# 模式一：让脚本自己跑 codex exec（推荐，最可靠）
+screen -dmS cpa-run /opt/cliproxyapi/autoresume.sh run -C /path/to/repo "把测试全部跑通并修掉失败项"
+tail -f /root/.cli-proxy-api/autoresume.log
+
+# 模式二：监控你已经手动开着的交互式 TUI
+screen -S cpa-codex                                  # 里面手动跑 codex
+/opt/cliproxyapi/autoresume.sh watch -s cpa-codex    # 另一个终端
+```
+
+`run` 模式首轮新建会话，之后每轮用 `codex exec resume --last` 续接同一会话，上下文不丢。`watch` 模式靠 `screen -X hardcopy` 抓屏检测，恢复后用 `screen -X stuff` 把继续指令打进去。
+
+选项：`-m N` 最大轮数（默认 24，每轮通常对应一个 5 小时窗口）、`-C DIR` 工作目录、`-s SESSION` 会话名、`-p SEC` 抓屏间隔。
+
+日志长这样：
+
+```
+[09-04 05:19:50] === run 模式启动 | 工作目录 /tmp | 上限 1 轮 ===
+[09-04 05:19:50] 全部凭据限流中 → 等待 3h09m 至 09-04 08:29:16
+```
+
+几个值得知道的实现细节：
+
+- **等待时长是查出来的，不是猜的。** 脚本从管理 API 读 `X-Codex-Primary-Reset-At` / `X-Codex-Secondary-Reset-At`，取真实 Unix 时间戳，再加 45 秒缓冲。不解析人类可读文本，也不用固定的「等 5 小时」。
+- **7 天窗口也算进去了。** 如果次窗口（7d）同样满了，等主窗口重置是没用的 —— 脚本会取两者中更晚的那个。
+- **睡觉期间仍在观察。** 分 120 秒一段睡，每段结束重新查一次池子。你中途登录了新账号，它会提前醒来继续干活，不用等到原定时刻。
+- **多账号时它基本不会触发。** 只要还有一个号没满，`next_reset` 返回 0，脚本直接往下跑 —— 真正干活的是 CPA 的自动切换，`autoresume.sh` 只在整池耗尽时才介入。
+- **非限流失败会立刻停。** 只有识别到 429 / `exceeded retry limit` / `usage limit` 这类特征才等待重试；编译错误、路径不存在之类的失败会直接退出并把最后 15 行打出来，不会陷入无意义的循环。
+
+最后一点值得说清楚：这是**遵守**限流 —— 撞到 429 就停手，等服务端告诉你的重置时刻到了再继续，本质上和 HTTP `Retry-After` 是一回事。它不绕过任何限制，也不会让你在窗口内多用一个 token。
 
 
 ## 配置项
@@ -388,16 +424,26 @@ logging-to-file: true  # 日志落盘而非只进 journald
 ## 文件布局
 
 ```
+cpa-codex-setup/            本仓库
+├── install.sh              一键部署
+├── uninstall.sh            卸载
+└── helpers/                辅助脚本模板（install.sh 替换占位符后落盘）
+    ├── login.sh
+    ├── status.sh
+    └── autoresume.sh
+
 /opt/cliproxyapi/
 ├── cli-proxy-api          CPA 主程序
 ├── login.sh               凭据登录助手
 ├── status.sh              凭据池与自动切换状态查看器
+├── autoresume.sh          限流后等窗口重置自动续跑
 └── config.example.yaml    上游完整配置样例（几百个可调字段都在这）
 
 /root/.cli-proxy-api/
 ├── config.yaml            实际生效的配置（0600）
 ├── .apikey.txt            下游客户端用的 API key 明文备份（0600）
 ├── .mgmtkey.txt           管理 API key 明文备份（0600）
+├── autoresume.log         autoresume.sh 的运行日志
 └── codex-*.json           OAuth 登录后生成的凭据，每账号一个
 
 /etc/systemd/system/cliproxyapi.service
@@ -409,6 +455,7 @@ logging-to-file: true  # 日志落盘而非只进 journald
 ```bash
 sudo /opt/cliproxyapi/status.sh          # 凭据池状态 + 自动切换开关的实际生效值
 journalctl -u cliproxyapi -f            # 实时日志：429 限流、超时、凭据切换都在这
+tail -f /root/.cli-proxy-api/autoresume.log   # 自动续跑的等待/恢复记录
 systemctl restart cliproxyapi           # 重启
 systemctl status cliproxyapi            # 状态
 ```
@@ -472,7 +519,10 @@ CPA 在非 TTY 环境下不会输出授权 URL 和设备码。后台重定向（
 请求到了 CPA 但没有能提供该模型的凭据。要么没登录，要么该账号等级不支持这个模型 —— 用 `/v1/models` 确认实际可用列表。
 
 **429 了但没有自动换号**
-先跑 `status.sh` 看 `request-retry` 的实际值。如果是 0，说明 `config.yaml` 里省略了这些字段（省略 = 零值 = 关闭），照上面「自动切换：核心开关」补齐再重启。如果已经是 3，那就看凭据池里是不是只有一个号 —— 没有第二个可切时，重试多少轮都是撞同一面墙。
+先跑 `status.sh` 看 `request-retry` 的实际值。如果是 0，说明 `config.yaml` 里省略了这些字段（省略 = 零值 = 关闭），照上面「自动切换：核心开关」补齐再重启。如果已经是 3，那就看凭据池里是不是只有一个号 —— 没有第二个可切时，重试多少轮都是撞同一面墙，这种情况用 `autoresume.sh` 等窗口重置。
+
+**autoresume.sh 一启动就报「凭据池为空」**
+`login.sh` 还没登录成功，或者登录的凭据 json 不在脚本读的 `AUTH_DIR` 下。用 `status.sh` 确认池子里到底有没有号。
 
 **HTTP 401**
 key 不对。用 `sudo cat /root/.cli-proxy-api/.apikey.txt` 取当前 key；注意 `config.yaml` 被手工改过后需要 `systemctl restart cliproxyapi`。

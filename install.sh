@@ -26,6 +26,8 @@
 set -euo pipefail
 
 readonly REPO="router-for-me/CLIProxyAPI"
+# 本脚本所在目录 —— helpers/ 模板从这里读取
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- 可通过环境变量覆盖的配置 ------------------------------------------------
 CPA_VERSION="${CPA_VERSION:-latest}"          # latest 或 vX.Y.Z
@@ -203,167 +205,30 @@ EOF
   fi
 }
 
-# ---- 5. 凭据登录助手 ---------------------------------------------------------
-install_login_helper() {
-  cat > "$CPA_DIR/login.sh" <<'EOF_LOGIN'
-#!/usr/bin/env bash
-# CLIProxyAPI 凭据登录助手
-# 注意: 必须在带 TTY 的真实终端中运行。CPA 在非 TTY 环境下不会打印授权 URL
-#       与设备码 (后台重定向 / 管道 / screen -dm 都拿不到输出)。
-set -euo pipefail
 
-BIN="@CPA_BIN@"
-CFG="@CPA_CFG@"
-AUTH_DIR="@AUTH_DIR@"
+# ---- 5. 辅助脚本 (login / status / autoresume) -------------------------------
+# 模板放在仓库的 helpers/ 下, 这里只做占位符替换 + 落盘, 便于单独阅读和修改。
+install_helpers() {
+  local src="$SCRIPT_DIR/helpers"
+  [ -d "$src" ] || die "未找到 $src —— 请在 clone 出来的仓库目录里运行本脚本"
 
-usage() {
-  cat <<EOF
-用法: $(basename "$0") [provider]
-
-  codex-device  ChatGPT/Codex 设备码登录 (默认, 无需 SSH 隧道, 推荐)
-  codex         ChatGPT/Codex OAuth 回调登录 (需 ssh -L 1455:127.0.0.1:1455)
-  claude        Claude OAuth 登录
-  gemini        Antigravity (Gemini) OAuth 登录
-  kimi          Kimi OAuth 登录
-  xai           xAI OAuth 登录
-
-凭据写入 $AUTH_DIR/*.json, 服务自动热加载, 无需重启。
-可重复登录多个账号, CPA 会按 strategy 轮询。
-EOF
-}
-
-case "${1:-codex-device}" in
-  codex-device)   FLAG="-codex-device-login" ;;
-  codex)          FLAG="-codex-login" ;;
-  claude)         FLAG="-claude-login" ;;
-  gemini)         FLAG="-antigravity-login" ;;
-  kimi)           FLAG="-kimi-login" ;;
-  xai)            FLAG="-xai-login" ;;
-  -h|--help|help) usage; exit 0 ;;
-  *) echo "未知 provider: $1" >&2; echo; usage; exit 1 ;;
-esac
-
-echo "启动登录流程: $FLAG"
-exec "$BIN" --config "$CFG" "$FLAG" -no-browser
-EOF_LOGIN
-
-  sed -i \
-    -e "s#@CPA_BIN@#$CPA_DIR/cli-proxy-api#" \
-    -e "s#@CPA_CFG@#$AUTH_DIR/config.yaml#" \
-    -e "s#@AUTH_DIR@#$AUTH_DIR#" \
-    "$CPA_DIR/login.sh"
-  chmod 0755 "$CPA_DIR/login.sh"
-  bash -n "$CPA_DIR/login.sh" || die "生成的 login.sh 语法错误"
-  ok "已安装登录助手: $CPA_DIR/login.sh"
-}
-
-# ---- 5b. 凭据池状态查看器 ----------------------------------------------------
-install_status_helper() {
-  cat > "$CPA_DIR/status.sh" <<'EOF_STATUS'
-#!/usr/bin/env bash
-# CPA 凭据池状态 —— 看清自动切换在拿什么号、谁被限流了
-set -euo pipefail
-
-AUTH_DIR="@AUTH_DIR@"
-ENDPOINT="@ENDPOINT@"
-
-command -v python3 >/dev/null || { echo "需要 python3" >&2; exit 1; }
-[ -s "$AUTH_DIR/.mgmtkey.txt" ] || { echo "未找到管理密钥: $AUTH_DIR/.mgmtkey.txt" >&2; exit 1; }
-MG="$(cat "$AUTH_DIR/.mgmtkey.txt")"
-
-fetch() { curl -fsS -m 15 -H "Authorization: Bearer $MG" "$ENDPOINT/v0/management/$1"; }
-
-PY_CFG=$(cat <<'PY'
-import json, sys
-d = json.load(sys.stdin)
-q = d.get("quota-exceeded") or {}
-r = d.get("routing") or {}
-rows = [
-    ("request-retry",         d.get("request-retry"),          "额外重试轮数, 0 = 不会换凭据重试"),
-    ("max-retry-credentials", d.get("max-retry-credentials"),  "每轮最多试几个凭据, 0 = 不限"),
-    ("max-retry-interval",    d.get("max-retry-interval"),     "命中冷却时的最长等待秒数"),
-    ("save-cooldown-status",  d.get("save-cooldown-status"),   "冷却状态是否持久化"),
-    ("quota switch-project",  q.get("switch-project"),         "配额耗尽是否自动换凭据"),
-    ("routing strategy",      r.get("strategy") or "(未设置)", "多凭据选择策略"),
-    ("session-affinity",      bool(r.get("session-affinity")), "同会话是否固定同一凭据"),
-]
-for k, v, note in rows:
-    print("  {:22} {:14} {}".format(k, str(v), note))
-if not d.get("request-retry"):
-    print("\n  [!] request-retry 为 0 —— 自动切换实际上是关闭的")
-PY
-)
-
-PY_POOL=$(cat <<'PY'
-import json, sys
-
-def secs(v):
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        return "-"
-    if v <= 0:
-        return "ready"
-    h, m = divmod(v // 60, 60)
-    return "{}h{:02d}m".format(h, m) if h else "{}m".format(m)
-
-d = json.load(sys.stdin)
-files = d.get("files") or []
-if not files:
-    print("  空 —— 先跑 login.sh 登录账号")
-    raise SystemExit(0)
-
-fmt = "  {:<30} {:<7} {:<6} {:<5} {:<7} {:<5} {:<4} {:<5} {}"
-hdr = fmt.format("ACCOUNT", "PROV", "PLAN", "5H", "RESET", "7D", "OK", "FAIL", "STATE")
-print(hdr)
-print("  " + "-" * (len(hdr) - 2))
-
-for f in files:
-    acct = (f.get("email") or f.get("account") or f.get("label") or f.get("id") or "?")[:30]
-    plan = (f.get("id_token") or {}).get("plan_type") or f.get("account_type") or "-"
-    sig = (f.get("quota") or {}).get("signals") or {}
-    if not sig:
-        for mq in (f.get("model_quotas") or {}).values():
-            sig = mq.get("signals") or {}
-            if sig:
-                break
-    pri = sig.get("X-Codex-Primary-Used-Percent")
-    sec = sig.get("X-Codex-Secondary-Used-Percent")
-    state = f.get("status") or "-"
-    if f.get("disabled"):
-        state = "disabled"
-    elif f.get("unavailable"):
-        state = "unavailable"
-    print(fmt.format(
-        acct, f.get("provider") or "-", plan,
-        (pri + "%") if pri else "-",
-        secs(sig.get("X-Codex-Primary-Reset-After-Seconds")),
-        (sec + "%") if sec else "-",
-        str(f.get("success", 0)), str(f.get("failed", 0)), state,
-    ))
-    if f.get("status_message"):
-        print("      └─ {}".format(f["status_message"]))
-
-print("\n  共 {} 个凭据".format(len(files)))
-print("  5H/7D = 主(5小时)/次(7天)配额窗口已用百分比; 空值表示尚未从上游响应学到信号")
-PY
-)
-
-echo "=== 自动切换配置 ==="
-fetch config | python3 -c "$PY_CFG"
-echo
-echo "=== 凭据池 ==="
-fetch auth-files | python3 -c "$PY_POOL"
-EOF_STATUS
   local probe="$CPA_HOST"
   [ -z "$probe" ] && probe="127.0.0.1"
-  sed -i \
-    -e "s#@AUTH_DIR@#$AUTH_DIR#" \
-    -e "s#@ENDPOINT@#http://$probe:$CPA_PORT#" \
-    "$CPA_DIR/status.sh"
-  chmod 0755 "$CPA_DIR/status.sh"
-  bash -n "$CPA_DIR/status.sh" || die "生成的 status.sh 语法错误"
-  ok "已安装状态查看器: $CPA_DIR/status.sh"
+
+  local name f
+  for name in login status autoresume; do
+    f="$src/$name.sh"
+    [ -f "$f" ] || die "缺少模板: $f"
+    sed -e "s#@CPA_BIN@#$CPA_DIR/cli-proxy-api#g" \
+        -e "s#@CPA_CFG@#$AUTH_DIR/config.yaml#g" \
+        -e "s#@CPA_DIR@#$CPA_DIR#g" \
+        -e "s#@AUTH_DIR@#$AUTH_DIR#g" \
+        -e "s#@ENDPOINT@#http://$probe:$CPA_PORT#g" \
+        "$f" > "$CPA_DIR/$name.sh"
+    chmod 0755 "$CPA_DIR/$name.sh"
+    bash -n "$CPA_DIR/$name.sh" || die "生成的 $name.sh 语法错误"
+  done
+  ok "已安装辅助脚本: login.sh (登录) / status.sh (状态) / autoresume.sh (限流续跑)"
 }
 
 # ---- 6. systemd 服务 ---------------------------------------------------------
@@ -525,6 +390,11 @@ $(printf '=%.0s' {1..78})
 
       $CPA_DIR/status.sh
 
+  限流后自动等到窗口重置再续跑 (适合长任务, 建议放进 screen):
+
+      screen -dmS cpa-run $CPA_DIR/autoresume.sh run -C /path/to/repo "你的任务"
+      tail -f $AUTH_DIR/autoresume.log
+
   提醒: 自动切换需要池里有 2 个以上凭据才有意义 —— 只登一个号时,
         限流了也无处可切。多跑几次 login.sh 登录不同账号。
 
@@ -541,8 +411,7 @@ main() {
   resolve_version
   install_binary
   setup_config
-  install_login_helper
-  install_status_helper
+  install_helpers
   install_service
   health_check
   [ "$SKIP_CODEX" = "1" ] || install_codex
