@@ -125,6 +125,211 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=$(sudo cat /root/.cli-proxy-api/.apikey.txt)
 ```
 
+## 高阶技巧
+
+### 审批与沙箱：从最严到最松
+
+Codex 默认会在执行命令前征求同意，并把写操作限制在工作区内。两个维度各自独立可调：
+
+| 维度 | 取值 | 含义 |
+|---|---|---|
+| `-s, --sandbox` | `read-only` | 只读，模型不能改任何文件 |
+| | `workspace-write` | 默认。可写工作目录、`/tmp`、`$TMPDIR` |
+| | `danger-full-access` | 无文件系统限制 |
+| `-a, --ask-for-approval` | `on-request` | 默认。模型自己判断何时该问你 |
+| | `never` | 从不询问，执行失败直接回传给模型 |
+
+组合使用，逐级放开：
+
+```bash
+codex -s read-only                          # 只让它看，最安全，适合代码审查
+codex -s workspace-write -a on-request      # 默认组合
+codex -s workspace-write -a never           # 不打断你，但仍受沙箱约束 ← 日常自动化推荐
+codex --approve-for-me                      # 审批请求走自动审查（workspace-write 内）
+```
+
+### 完全放开：`--dangerously-bypass-approvals-and-sandbox`
+
+```bash
+codex --dangerously-bypass-approvals-and-sandbox "把整个项目迁移到 TypeScript"
+codex exec --dangerously-bypass-approvals-and-sandbox "跑通所有测试并修掉失败项"
+```
+
+官方对这个 flag 的原话是 **EXTREMELY DANGEROUS**，用途明确写着「仅用于本身已被外部沙箱隔离的环境」。它同时关掉两道防线：所有确认提示消失，且命令不再受任何沙箱限制 —— 模型可以 `rm -rf`、改系统配置、写 `~/.ssh`、发起任意网络请求，没有一步会问你。
+
+合理的用法是：**先隔离环境，再放开权限**，而不是反过来。
+
+```bash
+# 一次性容器，宿主机文件系统不受影响
+# Linux 下 host.docker.internal 需要显式加 --add-host 才能解析
+docker run --rm -it --add-host=host.docker.internal:host-gateway \
+  -v "$PWD:/work" -w /work \
+  -e OPENAI_BASE_URL=http://host.docker.internal:8317/v1 \
+  -e OPENAI_API_KEY=$(sudo cat /root/.cli-proxy-api/.apikey.txt) \
+  node:22 bash -lc 'npm i -g @openai/codex && codex exec --dangerously-bypass-approvals-and-sandbox "..."'
+```
+
+在自己的开发机上跑，只要 `-s workspace-write -a never` 就已经不打断你了，没必要连沙箱一起关。真要在宿主机上放开，至少确认工作目录在 git 里且已提交 —— 出事能 `git reset --hard` 回来。
+
+还有一个相关的危险 flag：`--dangerously-bypass-hook-trust`，跳过 hook 来源的信任校验，只在你已经审过 hook 代码的自动化里用。
+
+### 无人值守与结构化输出
+
+`codex exec` 是脚本化入口，配合这几个选项能接进 CI：
+
+```bash
+codex exec --json "..."                          # 事件流以 JSONL 输出到 stdout
+codex exec -o result.txt "..."                   # 只把最终回答写进文件
+codex exec --output-schema schema.json "..."     # 用 JSON Schema 约束最终输出结构
+codex exec --skip-git-repo-check "..."           # 允许在非 git 目录运行
+codex exec --ephemeral "..."                     # 不落盘 session 文件
+codex exec --ignore-user-config "..."            # 忽略 config.toml，只用命令行参数
+```
+
+拼起来就是一个能被程序消费的 agent：
+
+```bash
+codex exec --json -s read-only \
+  --output-schema review-schema.json \
+  -o review.json "审查 src/ 下的安全问题" | tee events.jsonl
+```
+
+### 会话复用
+
+上下文是钱，别每次从零开始：
+
+```bash
+codex resume --last              # 接着上一个会话继续
+codex resume                     # 交互式挑一个历史会话
+codex fork --last                # 从上个会话分叉，试探性改动不污染主线
+codex queue "顺便把 README 也更新一下"   # 给正在跑的会话追加一条消息
+codex apply                      # 把 agent 产出的 diff 以 git apply 落到工作树
+codex archive <id> / delete <id> # 归档 / 永久删除会话
+```
+
+### 配置 profile：一套环境多种人格
+
+`-p <name>` 会把 `$CODEX_HOME/<name>.config.toml` 叠加到主配置之上。例如建 `~/.codex/fast.config.toml`：
+
+```toml
+model = "gpt-5.4-mini"
+model_reasoning_effort = "low"
+```
+
+之后 `codex -p fast "改个错别字"` 就走廉价配置，主配置一行都不用动。适合按任务类型分档：`fast` / `review` / `deep`。
+
+### 零散但好用
+
+```bash
+codex --search "查一下这个库最新的 breaking change"   # 开启联网搜索
+codex -i screenshot.png "照这个设计稿实现组件"        # 附图
+codex -C /path/to/repo "..."                        # 指定工作根目录
+codex --add-dir ../shared-lib "..."                 # 额外授予可写目录
+codex --no-alt-screen                               # 保留终端 scrollback，方便复制
+codex doctor                                        # 诊断安装、配置、认证、运行时
+codex sandbox <cmd>                                 # 手动在 Codex 沙箱里跑一条命令
+codex mcp                                           # 管理 MCP 服务器
+codex completion bash > /etc/bash_completion.d/codex # shell 补全
+```
+
+### CPA 侧：多账号池怎么调
+
+以下都写在 `~/.cli-proxy-api/config.yaml`。服务对配置目录开了 file watcher，多数字段改完即生效，可用 `journalctl -u cliproxyapi -n 20` 确认加载。
+
+**选择策略**
+
+```yaml
+routing:
+  strategy: "round-robin"   # 默认，轮流用
+  # weighted-round-robin    # 按权重分配，主力号多跑
+  # fill-first              # 填满一个再换下一个，最大化 prompt cache 命中
+```
+
+用 `weighted-round-robin` 时，权重写在凭据 JSON 的顶层（整数，默认 1，上限 1,000,000；非正数等于把该凭据摘出池子）：
+
+```bash
+# 给主力账号更高权重
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path('/root/.cli-proxy-api/codex-xxx.json')
+d = json.loads(p.read_text()); d['weight'] = 5
+p.write_text(json.dumps(d, indent=2))
+PY
+```
+
+**会话粘性 —— 省 token 的关键**
+
+```yaml
+routing:
+  session-affinity: true            # 同一会话始终绑同一个上游凭据
+  session-affinity-ttl: "1h"
+  session-affinity-subagents: true  # 子会话继承父会话的凭据
+```
+
+默认关闭。开启后同一对话的后续请求都落在同一个账号上，upstream 的 prompt/KV cache 才能复用，首 token 延迟和计费都会明显下降。代价是并发分散度变差 —— 追求并行吞吐就关掉它。
+
+**配额耗尽时的兜底**
+
+```yaml
+quota-exceeded:
+  switch-project: true         # 自动切到另一个可用凭据
+  switch-preview-model: true   # 自动降级到 preview 模型
+```
+
+**重试与冷却**
+
+```yaml
+request-retry: 3                      # 首轮之外额外重试轮数，对 403/408/429/5xx 生效
+max-retry-credentials: 0              # 每轮最多试几个凭据，0 = 不限
+max-retry-interval: 30                # 冷却等待上限（秒）
+transient-error-cooldown-seconds: 0   # 0 = 沿用 60s 传统值，-1 = 关闭瞬时错误冷却
+disable-cooling: false                # true = 出错的凭据不进冷却池
+```
+
+429 频繁的话先加账号，其次调 `request-retry`；把 `disable-cooling` 打开通常只会让失败更快重现。
+
+**模型改名**
+
+```yaml
+oauth-model-alias:
+  codex:
+    - name: "gpt-5.6-sol"       # 上游真实 id
+      alias: "sol"              # 客户端看到的 id
+      display-name: "Codex Sol"
+```
+
+按 channel 配置（`codex` / `claude` / `antigravity` / `aistudio` / `vertex` / `kimi` / `xai`）。注意别名**不作用于** `codex-api-key`、`claude-api-key`、`openai-compatibility` 这类显式 API key 块。
+
+**走代理出网**
+
+```yaml
+proxy-url: "socks5://user:pass@127.0.0.1:1080"
+```
+
+支持 socks5 / http / https；单条凭据里也能写 `proxy-url`，填 `"direct"` 或 `"none"` 可以显式绕开全局代理和环境变量代理。
+
+**管理 API**
+
+`.mgmtkey.txt` 里的 key 可以直接调管理接口，不必手改 YAML：
+
+```bash
+MG=$(sudo cat /root/.cli-proxy-api/.mgmtkey.txt)
+curl -s -H "Authorization: Bearer $MG" http://127.0.0.1:8317/v0/management/config | python3 -m json.tool
+```
+
+浏览器打开 `http://127.0.0.1:8317` 是自带的管理面板。远程访问需要 `remote-management.allow-remote: true` —— 开之前先想清楚暴露面。
+
+**排查请求**
+
+```yaml
+debug: true            # 打印详细请求日志
+logging-to-file: true  # 日志落盘而非只进 journald
+```
+
+调完记得关掉 `debug`，它会把请求内容写进日志。
+
+
+
 ## 配置项
 
 全部通过环境变量传给 `install.sh`：
