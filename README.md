@@ -236,6 +236,25 @@ codex completion bash > /etc/bash_completion.d/codex # shell 补全
 
 以下都写在 `~/.cli-proxy-api/config.yaml`。服务对配置目录开了 file watcher，多数字段改完即生效，可用 `journalctl -u cliproxyapi -n 20` 确认加载。
 
+> **先看这条，否则自动切换是关着的。** `config.example.yaml` 注释里写的「默认 3」「默认 30」是**示例文件里的推荐值，不是程序内置 fallback**。字段一旦在你的 `config.yaml` 里省略，生效值就是 Go 零值 —— `request-retry: 0`、`quota-exceeded.switch-project: false`、`routing: {}`。也就是说：一份极简配置跑起来，遇到 429 既不会重试也不会换号。本仓库的 `install.sh` 已经把这些字段显式写全，手写配置的话务必自己补上。用 `status.sh` 可以一眼看出当前到底是开还是关。
+
+**自动切换：核心开关**
+
+```yaml
+request-retry: 3              # 首轮之外的额外重试轮数，每轮换用池中其他凭据
+max-retry-credentials: 0      # 每轮最多试几个凭据，0 = 不限（可把整池试一遍）
+max-retry-interval: 30        # 命中冷却时的最长等待秒数
+save-cooldown-status: true    # 冷却状态持久化，重启不会把限流中的号立刻放回池子
+
+quota-exceeded:
+  switch-project: true        # 上游报配额耗尽时自动切到另一个可用凭据
+  switch-preview-model: true  # 自动降级到 preview 模型
+```
+
+`request-retry` 是主开关，对 403 / 408 / 429 / 500 / 502 / 503 / 504 生效。切换是**被动**的：先撞到错误，再换下一个凭据重试，而不是提前预测哪个号快满了。
+
+一个容易忽略的前提：**池里得有第二个号**。只登了一个账号时，限流了也无处可切，`request-retry` 调到 10 也没用 —— 先多跑几次 `login.sh`。
+
 **选择策略**
 
 ```yaml
@@ -268,25 +287,43 @@ routing:
 
 默认关闭。开启后同一对话的后续请求都落在同一个账号上，upstream 的 prompt/KV cache 才能复用，首 token 延迟和计费都会明显下降。代价是并发分散度变差 —— 追求并行吞吐就关掉它。
 
-**配额耗尽时的兜底**
+**冷却微调**
+
+上面那组开关之外，还有两个控制冷却行为的字段：
 
 ```yaml
-quota-exceeded:
-  switch-project: true         # 自动切到另一个可用凭据
-  switch-preview-model: true   # 自动降级到 preview 模型
-```
-
-**重试与冷却**
-
-```yaml
-request-retry: 3                      # 首轮之外额外重试轮数，对 403/408/429/5xx 生效
-max-retry-credentials: 0              # 每轮最多试几个凭据，0 = 不限
-max-retry-interval: 30                # 冷却等待上限（秒）
 transient-error-cooldown-seconds: 0   # 0 = 沿用 60s 传统值，-1 = 关闭瞬时错误冷却
 disable-cooling: false                # true = 出错的凭据不进冷却池
 ```
 
 429 频繁的话先加账号，其次调 `request-retry`；把 `disable-cooling` 打开通常只会让失败更快重现。
+
+**凭据池状态：`status.sh`**
+
+自动切换是被动的，所以你需要一个能主动看清池子的入口：
+
+```bash
+sudo /opt/cliproxyapi/status.sh
+```
+
+它做两件事 —— 先把自动切换的几个开关的**实际生效值**打出来（不是你以为写了什么，而是服务真正读到什么），再列出池里每个凭据的配额与健康状况：
+
+```
+=== 自动切换配置 ===
+  request-retry          3              额外重试轮数, 0 = 不会换凭据重试
+  routing strategy       round-robin    多凭据选择策略
+  ...
+
+=== 凭据池 ===
+  ACCOUNT                   PROV    PLAN   5H    RESET   7D    OK   FAIL  STATE
+  ----------------------------------------------------------------------------
+  you@example.com           codex   plus   100%  3h24m   16%   0    1     unavailable
+      └─ {"error":{"type":"usage_limit_reached", ...}}
+```
+
+`5H` / `7D` 是主（5 小时窗口）和次（7 天窗口）配额的已用百分比，`RESET` 是主窗口的重置倒计时 —— 这些数字来自上游响应头（`X-Codex-Primary-Used-Percent` 等），CPA 会随请求学习并缓存。刚重启时显示 `-`，发一次请求就有了。
+
+有了它，「为什么突然不动了」这类问题基本一眼就能定位：是号满了、是被冷却了、还是自动切换压根没开。
 
 **模型改名**
 
@@ -354,6 +391,7 @@ logging-to-file: true  # 日志落盘而非只进 journald
 /opt/cliproxyapi/
 ├── cli-proxy-api          CPA 主程序
 ├── login.sh               凭据登录助手
+├── status.sh              凭据池与自动切换状态查看器
 └── config.example.yaml    上游完整配置样例（几百个可调字段都在这）
 
 /root/.cli-proxy-api/
@@ -369,6 +407,7 @@ logging-to-file: true  # 日志落盘而非只进 journald
 ## 运维
 
 ```bash
+sudo /opt/cliproxyapi/status.sh          # 凭据池状态 + 自动切换开关的实际生效值
 journalctl -u cliproxyapi -f            # 实时日志：429 限流、超时、凭据切换都在这
 systemctl restart cliproxyapi           # 重启
 systemctl status cliproxyapi            # 状态
@@ -386,6 +425,41 @@ systemctl status cliproxyapi            # 状态
 - **凭据等于账号。** `~/.cli-proxy-api/*.json` 是 OAuth token，泄露等同账号泄露。别把这个目录提交进任何仓库。
 - **不要把生成的 config 文件推上 GitHub。** 本仓库只包含脚本和文档，不含任何密钥。
 
+## 多账号：能用，但要知道边界
+
+「一台服务器上登录多个账号会不会被限制」是个绕不开的问题。分三层说清楚。
+
+**官方条款怎么写的**
+
+[Terms of Use](https://www.openai.com/terms/) 里明确的一句是：
+
+> You may not share your account credentials or make your account available to anyone else and are responsible for all activities that occur under your account.
+
+而 [Account Sharing Policy](https://help.openai.com/en/articles/10471989-openai-account-sharing-policy) 则说：
+
+> You are welcome to use your OpenAI account on multiple devices. However, please note that usage limits may apply depending on your account activity and subscription level.
+
+拆开看：**你自己的账号在多台设备/多个客户端上用是被允许的**；**把凭据交给别人用是被禁止的**。至于「一个人持有多个账号」，条款没有明文禁止，但同一句话也写了 usage limits 会随「账号活动」浮动 —— 也就是说限流阈值本身是动态的、由服务端判定的。
+
+**技术上会被看到什么**
+
+CPA 是拿你的 OAuth 登录态去调上游，请求从同一台机器、同一个出口 IP 发出。所以服务端能观察到的至少包括：同 IP 下多个账号的活动、每个账号的调用量与时间分布、客户端特征。CPA 默认会强制带上官方 Codex 的 User-Agent 和 Originator 头（`codex.disable-codex-cloaking: false`），所以它在协议层看起来就是官方客户端。
+
+配置里有个 `codex.identity-confuse` 开关，作用是按凭据重映射 `prompt_cache_key` 和 installation 身份。值得一提的是上游作者自己在注释里对它的评价：
+
+> Some superstitious users believe request tracking identifiers can be used as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
+
+翻译过来：作者认为这个选项主要是安慰迷信的人。别把它当护身符。
+
+**所以实际怎么办**
+
+我没法向你保证「不会被限制」—— 判定逻辑在 OpenAI 手里，不公开，也随时可能变。能给的是几条务实的边界：
+
+- 只用**你自己**的账号。借号、买号、共享凭据是条款明文禁止的那一类，风险性质完全不同。
+- 把它当「个人的多设备统一入口」用，而不是「额度池对外供货」。后者已经是在做转售，那是另一回事。
+- 商业用途、团队共用、或者调用量确实大 —— 用官方 API key（`codex-api-key` 配置块）或 ChatGPT Business/Enterprise。按量付费的额度不会因为「行为异常」被收走，这个确定性值钱。
+- 真被限流了先看 `status.sh`：如果 `5H` 是 100% 而 `7D` 只有百分之十几，那是短窗口限流，等重置就好，不是封号。
+
 ## 故障排查
 
 **登录时终端什么都不打印，或退出码 144**
@@ -396,6 +470,9 @@ CPA 在非 TTY 环境下不会输出授权 URL 和设备码。后台重定向（
 
 **`unknown provider for model xxx` (HTTP 400)**
 请求到了 CPA 但没有能提供该模型的凭据。要么没登录，要么该账号等级不支持这个模型 —— 用 `/v1/models` 确认实际可用列表。
+
+**429 了但没有自动换号**
+先跑 `status.sh` 看 `request-retry` 的实际值。如果是 0，说明 `config.yaml` 里省略了这些字段（省略 = 零值 = 关闭），照上面「自动切换：核心开关」补齐再重启。如果已经是 3，那就看凭据池里是不是只有一个号 —— 没有第二个可切时，重试多少轮都是撞同一面墙。
 
 **HTTP 401**
 key 不对。用 `sudo cat /root/.cli-proxy-api/.apikey.txt` 取当前 key；注意 `config.yaml` 被手工改过后需要 `systemctl restart cliproxyapi`。
