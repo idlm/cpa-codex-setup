@@ -1,0 +1,20 @@
+# 密钥与 OAuth 凭据 —— 绝不入库
+.apikey.txt
+.mgmtkey.txt
+config.yaml
+config.toml
+codex-*.json
+claude-*.json
+gemini-*.json
+kimi-*.json
+xai-*.json
+antigravity-*.json
+
+# 备份文件
+*.bak
+*.bak.*
+
+# 本地临时产物
+*.tar.gz
+checksums.txt
+*.log
