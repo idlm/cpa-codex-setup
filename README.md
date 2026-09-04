@@ -26,7 +26,7 @@ CPA 是一个协议转换代理：它把你手里的 **CLI 订阅**（ChatGPT Pl
 ## 快速开始
 
 ```bash
-git clone https://github.com/<你的用户名>/cpa-codex-setup.git
+git clone https://github.com/idlm/cpa-codex-setup.git
 cd cpa-codex-setup
 sudo ./install.sh
 ```
