@@ -26,6 +26,7 @@ BUFFER=45                  # 重置时刻之后再多等几秒, 防止边界抖�
 FALLBACK_WAIT=300          # 拿不到配额信号时的保守重试间隔
 SIGNAL_LAG=90              # -l 覆盖; 上游已 429 但 CPA 配额信号还没更新时的冷静期
 WORKDIR=""                 # -C 覆盖
+LOGSRC=""                  # -f 覆盖; watch 模式改从 screen 日志文件读取
 
 command -v python3 >/dev/null || { echo "需要 python3" >&2; exit 1; }
 [ -s "$AUTH_DIR/.mgmtkey.txt" ] || { echo "未找到管理密钥: $AUTH_DIR/.mgmtkey.txt" >&2; exit 1; }
@@ -166,19 +167,46 @@ mode_run() {
 # 监控一个已存在的 screen 会话里的交互式 codex TUI。
 screen_alive() { screen -ls 2>/dev/null | grep -qE "[0-9]+\.${SESSION}[[:space:]]"; }
 
-grab() {   # 抓当前屏内容到 stdout
+grab() {   # 取当前可见输出到 stdout (统一滤掉 NUL, 否则命令替换会刷警告)
+  if [ -n "$LOGSRC" ]; then
+    [ -f "$LOGSRC" ] && tail -c 8000 "$LOGSRC" 2>/dev/null | tr -d '\000'
+    return 0
+  fi
   local hc; hc="$(mktemp)"
   screen -S "$SESSION" -X hardcopy "$hc" >/dev/null 2>&1 || { rm -f "$hc"; return 1; }
   sleep 0.3
-  cat "$hc" 2>/dev/null; rm -f "$hc"
+  tr -d '\000' < "$hc" 2>/dev/null; rm -f "$hc"
+}
+
+# hardcopy 只能看到"当前屏幕"。交互式 TUI 会不断重绘, 限流提示可能已经被
+# 后续界面覆盖 —— 这是 watch 模式的固有局限, 用 -f 读 screen 的累积日志可以
+# 绕开(日志里的历史不会被重绘冲掉)。这里只做一层兜底: 如果连一屏字符都读不到,
+# 说明抓取通道本身有问题, 直接报错而不是空转到轮数耗尽。
+verify_readable() {
+  local probe stripped
+  probe="$(grab || true)"
+  stripped="$(printf '%s' "$probe" | tr -d '[:space:]')"
+  [ "${#stripped}" -ge 16 ] && return 0
+
+  warn "读不到会话输出 (有效字符 ${#stripped} 个)。"
+  if [ -n "$LOGSRC" ]; then
+    warn "日志文件 $LOGSRC 为空或不存在 —— 确认 screen 启动时带了 -L -Logfile。"
+  else
+    warn "screen -X hardcopy 抓不到这个会话的内容。改用日志方式:"
+    warn "  screen -dmS $SESSION -L -Logfile /tmp/$SESSION.log codex"
+    warn "  $0 watch -s $SESSION -f /tmp/$SESSION.log"
+  fi
+  warn "已中止, 以免空转白等。run 模式不依赖屏幕抓取, 是更可靠的选择。"
+  return 1
 }
 
 mode_watch() {
   command -v screen >/dev/null || { say "未安装 screen"; return 1; }
   screen_alive || { say "screen 会话 '$SESSION' 不存在。先建: screen -S $SESSION"; return 1; }
+  verify_readable || return 1
 
   local round=0 screen_txt
-  say "=== watch 模式启动 | 会话 $SESSION | 轮询 ${POLL}s | 上限 $MAX_ROUNDS 轮 ==="
+  say "=== watch 模式启动 | 会话 $SESSION | 轮询 ${POLL}s | 上限 $MAX_ROUNDS 轮${LOGSRC:+ | 读日志 $LOGSRC} ==="
   while [ "$round" -lt "$MAX_ROUNDS" ]; do
     if ! screen_alive; then say "会话 $SESSION 已消失, 退出"; return 0; fi
     screen_txt="$(grab || true)"
@@ -211,6 +239,7 @@ usage() {
   -m N         最大轮数 (默认 24; 每轮通常对应一个 5 小时窗口)
   -C DIR       run 模式的工作目录
   -p SEC       watch 模式抓屏间隔 (默认 60)
+  -f FILE      watch 模式改从 screen 日志文件读取 (交互式 TUI 必需, 见下)
   -l SEC       撞到 429 但 CPA 配额信号还没更新时的冷静期 (默认 90)
 
 典型用法 —— 把 run 模式本身放进 screen, 断线也不影响:
@@ -220,22 +249,29 @@ usage() {
   tail -f @AUTH_DIR@/autoresume.log
 
 已经手动开着 TUI 的场景:
-  screen -S cpa-codex        # 里面手动跑 codex
-  # 另开一个终端:
+  # hardcopy 只看得到"当前屏幕", 而 TUI 会不断重绘 —— 限流提示可能在脚本
+  # 下一次抓屏前就被覆盖掉。开 screen 日志读累积输出更稳:
+  screen -dmS cpa-codex -L -Logfile /tmp/cpa.log codex
+  @CPA_DIR@/autoresume.sh watch -s cpa-codex -f /tmp/cpa.log
+
+  # 不带 -f 也能跑(直接抓屏), 但漏检风险更高:
   @CPA_DIR@/autoresume.sh watch -s cpa-codex
+
+  要确定性就用 run 模式 —— 它按退出码判断, 不依赖屏幕抓取。
 
 等待时长取自 CPA 管理 API 的真实重置时间戳; 若 7 天窗口也满了会自动等更久的那个。
 EOF
 }
 
 MODE="${1:-}"; shift 2>/dev/null || true
-while getopts "s:m:C:p:l:h" o; do
+while getopts "s:m:C:p:l:f:h" o; do
   case "$o" in
     s) SESSION="$OPTARG" ;;
     m) MAX_ROUNDS="$OPTARG" ;;
     C) WORKDIR="$OPTARG" ;;
     p) POLL="$OPTARG" ;;
     l) SIGNAL_LAG="$OPTARG" ;;
+    f) LOGSRC="$OPTARG" ;;
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac

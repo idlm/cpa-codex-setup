@@ -417,6 +417,21 @@ screen -S cpa-codex                                  # 里面手动跑 codex
 
 `run` 模式首轮新建会话，之后每轮用 `codex exec resume --last` 续接同一会话，上下文不丢。`watch` 模式靠 `screen -X hardcopy` 抓屏检测，恢复后用 `screen -X stuff` 把继续指令打进去。
 
+**两种模式的可靠性不一样，优先选 run**
+
+`run` 按 `codex exec` 的退出码和输出判断，确定性高。`watch` 依赖抓屏，而 `hardcopy` 只能看到**当前屏幕** —— 交互式 TUI 不断重绘，那行 `You've hit your usage limit` 很可能在脚本下一次抓屏（默认 60 秒一次）之前就被覆盖掉，于是漏检。
+
+要用 `watch` 就开 screen 日志，让脚本读累积输出，历史不会被重绘冲掉：
+
+```bash
+screen -dmS cpa-codex -L -Logfile /tmp/cpa.log codex
+/opt/cliproxyapi/autoresume.sh watch -s cpa-codex -f /tmp/cpa.log
+```
+
+脚本启动时会先探一次抓取通道，读不到内容就直接报错退出，不会闷头空转到轮数耗尽。
+
+另外注意：`stuff` 是往会话的 stdin 里塞字符。如果那个 screen 正被你 attach 着、你又刚好在打字，两边会混在一起。
+
 **解封那一刻具体发生什么**
 
 会自己接着跑，不需要你在场。以 `run` 模式为例，一次完整的限流—恢复循环是这样：
